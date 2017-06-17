@@ -1,0 +1,308 @@
+--- nse_openssl.cc.orig	2010-03-28 23:18:02.000000000 +0200
++++ nse_openssl.cc	2010-10-20 19:50:43.000000000 +0200
+@@ -5,6 +5,9 @@
+  * bignum and rand_bytes functions added by Sven Klemm <sven@c3d2.de>
+  */
+ 
++#include <stdio.h>
++#include <strings.h>
++
+ #include <openssl/crypto.h>
+ #include <openssl/bn.h>
+ #include <openssl/rand.h>
+@@ -29,6 +32,11 @@
+   BIGNUM * bn;
+ } bignum_data_t;
+ 
++typedef struct ctx_data {
++  HMAC_CTX * hmac_ctx;
++  EVP_CIPHER_CTX * ctx;
++} ctx_data_t;
++
+ static int l_bignum_bin2bn( lua_State *L ) /** bignum_bin2bn( string s ) */
+ {
+   size_t len;
+@@ -66,6 +74,19 @@
+   return 1;
+ }
+ 
++static int l_bignum_mpi2bn( lua_State *L ) /** bignum_mpi2bn( string s, number len ) */
++{
++  const char * s = luaL_checkstring( L, 1 );
++  size_t len = luaL_checkint( L, 2 );
++  BIGNUM * num = BN_new();
++  BN_mpi2bn( (const unsigned char *) s, len, num );
++  bignum_data_t * data = (bignum_data_t *) lua_newuserdata( L, sizeof(bignum_data_t));
++  luaL_getmetatable( L, "BIGNUM" );
++  lua_setmetatable( L, -2 );
++  data->bn = num;
++  return 1;
++}
++
+ static int l_bignum_rand( lua_State *L ) /** bignum_rand( number bits ) */
+ {
+   size_t bits = luaL_checkint( L, 1 );
+@@ -188,6 +209,18 @@
+   return 1;
+ }
+ 
++static int l_bignum_bn2mpi( lua_State *L ) /** bignum_bn2mpi( BIGNUM bn ) */
++{
++  bignum_data_t * userdata = (bignum_data_t *) luaL_checkudata(L, 1, "BIGNUM");
++  int len = BN_bn2mpi( userdata->bn, NULL );
++  unsigned char * result = (unsigned char *) malloc( len );
++  if (!result) return luaL_error( L, "Couldn't allocate memory.");
++  BN_bn2mpi( userdata->bn, result);
++  lua_pushlstring( L, (char *) result, len );
++  OPENSSL_free( result );
++  return 1;
++}
++
+ static int l_bignum_free( lua_State *L ) /** bignum_free( bignum ) */
+ {
+   bignum_data_t * userdata = (bignum_data_t *) luaL_checkudata(L, 1, "BIGNUM");
+@@ -465,6 +498,154 @@
+   return 1;
+ }
+ 
++static int l_ctx_init(lua_State *L) /** ctx_init( string algorithm, option type, int key_size, string key, int block_size, string iv, int discard_len ) */
++{
++  const char *algorithm = luaL_checkstring( L, 1 );
++
++  static const enum ctx_init_type types[] = {
++    CTX_INIT_TYPE_NONE,
++    CTX_INIT_TYPE_ENCRYPT,
++    CTX_INIT_TYPE_DECRYPT,
++    CTX_INIT_TYPE_HMAC,
++  };
++
++  static const char *ops[] = { "none", "encrypt", "decrypt", "hmac", };
++  enum ctx_init_type type = types[luaL_checkoption( L, 2, "none", ops )];
++
++  int key_size = luaL_checkint( L, 3 );
++  size_t key_len = 0;
++  const unsigned char *key = (unsigned char *) luaL_checklstring( L, 4, &key_len );
++
++  int block_size = luaL_optint( L, 5, 0 );
++  size_t iv_len = 0;
++  const unsigned char *iv = (unsigned char *) luaL_optlstring( L, 6, "", &iv_len );
++
++  int discard_len = luaL_optint( L, 7, 0 );
++
++
++  if (CTX_INIT_TYPE_NONE == type)
++    return luaL_argerror( L, 2, "invalid EVP (3) cipher context (either `decrypt,' `encrypt,' or `hmac.'" );
++
++  if (key_size != (int) key_len) return luaL_error( L, "Incompatible key size (got %d bytes, need %d bytes.)", key_len, key_size );
++  if (block_size > (int) iv_len) return luaL_error( L, "Incompatible IV size (got %d bytes, need %d bytes.)", iv_len, block_size );
++
++  if (CTX_INIT_TYPE_HMAC == type)
++  {
++    const EVP_MD * evp_md = EVP_get_digestbyname( algorithm );
++    if (!evp_md) return luaL_error( L, "Unknown digest algorithm: %s", algorithm );
++
++    HMAC_CTX * ctx;
++    ctx = (HMAC_CTX *) malloc( sizeof(*ctx) ); 
++    if (!ctx) return luaL_error( L, "Couldn't allocate memory.");
++    HMAC_CTX_init( ctx );
++    HMAC_Init_ex( ctx, key, ( 0 == key_size ? (int) key_len : key_size ), evp_md, NULL );
++
++    ctx_data_t * data = (ctx_data *) lua_newuserdata( L, sizeof(ctx_data));
++    luaL_getmetatable( L, "CTX" );
++    lua_setmetatable( L, -2 );
++    data->hmac_ctx = ctx;
++    data->ctx = NULL;
++  }
++  else
++  {
++    const EVP_CIPHER * evp_cipher = EVP_get_cipherbyname( algorithm );
++    bool encrypt = (type == CTX_INIT_TYPE_ENCRYPT);
++    EVP_CIPHER_CTX * ctx;
++
++
++    if (!evp_cipher) return luaL_error( L, "Unknown cipher algorithm: %s", algorithm );
++    ctx = (EVP_CIPHER_CTX *) malloc( sizeof(*ctx) ); 
++    if (!ctx) return luaL_error( L, "Couldn't allocate memory.");
++    EVP_CIPHER_CTX_init( ctx );
++
++    if (!(
++          EVP_CipherInit( ctx, evp_cipher, NULL, *iv ? iv : NULL, encrypt ) &&
++          EVP_CIPHER_CTX_set_key_length( ctx, key_len ) &&
++          EVP_CipherInit( ctx, NULL, key, NULL, encrypt ) &&
++          EVP_CIPHER_CTX_set_padding( ctx, 0 )))
++    {
++fail: EVP_CIPHER_CTX_cleanup( ctx );
++      unsigned long e = ERR_get_error();
++      return luaL_error( L, "OpenSSL error %d in %s: function %s: %s", e, ERR_lib_error_string(e), 
++                         ERR_func_error_string(e), ERR_reason_error_string(e));
++    }
++
++    if (0 < discard_len) {
++       u_char *junk = (u_char *) malloc( discard_len ),
++              *discard = (u_char *) malloc( discard_len );
++
++       if (!junk || !discard) return luaL_error( L, "Couldn't allocate memory.");
++
++       if (!EVP_Cipher( ctx, discard, junk, discard_len ))
++         goto fail;
++
++       memset( discard, 0, discard_len );
++       free( junk );
++       free( discard );
++    }
++
++    ctx_data_t * data = (ctx_data *) lua_newuserdata( L, sizeof(ctx_data));
++    luaL_getmetatable( L, "CTX" );
++    lua_setmetatable( L, -2 );
++    data->hmac_ctx = NULL;
++    data->ctx = ctx;
++  } 
++
++  return 1;
++}
++
++static int l_ctx_crypt(lua_State *L) /** ctx_crypt( CTX ctx , string data ) */
++{
++  ctx_data_t * userdata = (ctx_data_t *) luaL_checkudata(L, 1, "CTX");
++  size_t data_len;
++  const unsigned char *data = (unsigned char *) luaL_checklstring( L, 2, &data_len );
++
++  unsigned char * out = (unsigned char *) malloc( data_len );
++  if (!out) return luaL_error( L, "Couldn't allocate memory.");
++
++  if (data_len % EVP_CIPHER_CTX_block_size( (const EVP_CIPHER_CTX*) userdata->ctx ))
++    return luaL_error( L, "bad plaintext length %d", data_len );
++
++  if (!EVP_Cipher( userdata->ctx, out, data, data_len ))
++  {
++    EVP_CIPHER_CTX_cleanup( userdata->ctx );
++    free( out );
++    unsigned long e = ERR_get_error();
++    return luaL_error( L, "OpenSSL error %d in %s: function %s: %s", e, ERR_lib_error_string(e), 
++                       ERR_func_error_string(e), ERR_reason_error_string(e));
++  }
++
++  lua_pushlstring( L, (char *) out, data_len );
++  free( out );
++
++  return 1;
++}
++
++static int l_ctx_hmac(lua_State *L) /** ctx_hmac( CTX ctx , string message ) */
++{
++  ctx_data_t * userdata = (ctx_data_t *) luaL_checkudata(L, 1, "CTX");
++  size_t message_len = 0;
++  const unsigned char *message = (unsigned char *) luaL_checklstring( L, 2, &message_len );
++  unsigned char digest[EVP_MAX_MD_SIZE];
++  unsigned int digest_len = 0;
++
++  HMAC_Init_ex( userdata->hmac_ctx, NULL, 0, NULL, NULL );
++  HMAC_Update( userdata->hmac_ctx, message, message_len );
++  HMAC_Final( userdata->hmac_ctx, digest, &digest_len );
++
++  lua_pushlstring( L, (char *) digest, digest_len );
++
++  return 1;
++}
++
++static int l_ctx_free( lua_State *L ) /** ctx_free( CTX ) */
++{
++  ctx_data_t * userdata = (ctx_data_t *) luaL_checkudata(L, 1, "CTX");
++  if( NULL != userdata->hmac_ctx ) HMAC_CTX_cleanup( userdata->hmac_ctx );
++  if( NULL != userdata->ctx ) EVP_CIPHER_CTX_cleanup( userdata->ctx );
++  return 0;
++}
++
+ static int l_DES_string_to_key(lua_State *L) /** DES_string_to_key( string data ) */
+ {
+   size_t len;
+@@ -489,6 +670,7 @@
+   { "tobin", l_bignum_bn2bin },
+   { "todec", l_bignum_bn2dec },
+   { "tohex", l_bignum_bn2hex },
++  { "tompi", l_bignum_bn2mpi },
+   { "is_bit_set", l_bignum_is_bit_set },
+   { "set_bit", l_bignum_set_bit },
+   { "clear_bit", l_bignum_clear_bit },
+@@ -497,6 +679,13 @@
+   { NULL, NULL }
+ };
+ 
++static const struct luaL_reg ctx_methods[] = {
++  { "crypt", l_ctx_crypt },
++  { "hmac", l_ctx_hmac },
++  { "__gc", l_ctx_free },
++  { NULL, NULL }
++};
++
+ static const struct luaL_reg openssllib[] = {
+   { "bignum_num_bits", l_bignum_num_bits },
+   { "bignum_num_bytes", l_bignum_num_bytes },
+@@ -506,11 +695,13 @@
+   { "bignum_bin2bn", l_bignum_bin2bn },
+   { "bignum_dec2bn", l_bignum_dec2bn },
+   { "bignum_hex2bn", l_bignum_hex2bn },
++  { "bignum_mpi2bn", l_bignum_mpi2bn },
+   { "bignum_rand", l_bignum_rand },
+   { "bignum_pseudo_rand", l_bignum_pseudo_rand },
+   { "bignum_bn2bin", l_bignum_bn2bin },
+   { "bignum_bn2dec", l_bignum_bn2dec },
+   { "bignum_bn2hex", l_bignum_bn2hex },
++  { "bignum_bn2mpi", l_bignum_bn2mpi },
+   { "bignum_add", l_bignum_add },
+   { "bignum_mod_exp", l_bignum_mod_exp },
+   { "rand_bytes", l_rand_bytes },
+@@ -524,6 +715,9 @@
+   { "hmac", l_hmac },
+   { "encrypt", l_encrypt },
+   { "decrypt", l_decrypt },
++  { "ctx_init", l_ctx_init },
++  { "ctx_crypt", l_ctx_crypt },
++  { "ctx_hmac", l_ctx_hmac },
+   { "DES_string_to_key", l_DES_string_to_key },
+   { "supported_digests", l_supported_digests },
+   { "supported_ciphers", l_supported_ciphers },
+@@ -547,6 +741,16 @@
+ 
+   lua_pop( L, 1 ); // BIGNUM
+ 
++  // create metatable for ctx
++  luaL_newmetatable( L, "CTX" );
++  // metatable.__index = metatable
++  lua_pushvalue( L, -1 );
++  lua_setfield( L, -2, "__index" );
++  // register methods
++  luaL_register( L, NULL, ctx_methods );
++
++  lua_pop( L, 1 ); // CTX
++
+   return 1;
+ }
+ 
+--- nse_openssl.h.orig	2009-06-24 23:35:54.000000000 +0200
++++ nse_openssl.h	2010-06-24 20:33:13.000000000 +0200
+@@ -3,6 +3,13 @@
+ 
+ #define OPENSSLLIBNAME "openssl"
+ 
++enum ctx_init_type {
++  CTX_INIT_TYPE_NONE = 1,
++  CTX_INIT_TYPE_ENCRYPT,
++  CTX_INIT_TYPE_DECRYPT,
++  CTX_INIT_TYPE_HMAC,
++};
++
+ LUALIB_API int luaopen_openssl(lua_State *L);
+ 
+ #endif
+--- nse_nsock.cc.orig	2010-06-25 19:24:43.000000000 +0200
++++ nse_nsock.cc	2010-06-25 19:25:15.000000000 +0200
+@@ -631,8 +631,6 @@
+ 
+   size_t string_len = lua_objlen(L, 2);
+ 
+-  l_nsock_clear_buf(L, udata);
+-
+   if (udata->nsiod == NULL)
+   {
+     lua_pushboolean(L, false);
